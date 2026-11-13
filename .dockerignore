@@ -1,0 +1,9 @@
+.venv
+.git
+__pycache__
+*.pyc
+.env
+data/*.db*
+models/*.joblib
+models/profile.json
+.pytest_cache

@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: crop-advisor
+    runtime: docker
+    plan: free
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: CA_API_KEY
+        generateValue: true
+      - key: CA_MOCK_WEATHER
+        value: "0"
