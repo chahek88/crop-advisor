@@ -62,6 +62,8 @@ def _alerts(sensor: dict, wx: dict | None, wx_error: str | None) -> list[dict]:
         a.append({"level": "warning", "message": f"Live weather unavailable ({wx_error[:80]}). Weather inputs are missing."})
     elif wx and wx.get("stale"):
         a.append({"level": "info", "message": "Weather service unreachable; showing the last cached data."})
+    elif wx and wx.get("source") == "nasa-power":
+        a.append({"level": "info", "message": "Open-Meteo is busy, so temperature, humidity and rainfall come from NASA POWER (a few days behind, no forecast)."})
 
     v = sensor["values"]
     rain_3d = None

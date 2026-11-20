@@ -35,7 +35,11 @@ class Settings:
     k_factor: float = field(default_factory=lambda: float(_env("K_FACTOR", "1.0")))
 
     # external data
-    weather_cache_seconds: int = field(default_factory=lambda: int(_env("WEATHER_CACHE_SECONDS", "600")))
+    weather_cache_seconds: int = field(default_factory=lambda: int(_env("WEATHER_CACHE_SECONDS", "3600")))
+    # after a failed fetch, do not call the weather APIs again for this long (the dashboard refreshes every few seconds)
+    weather_retry_seconds: int = field(default_factory=lambda: int(_env("WEATHER_RETRY_SECONDS", "300")))
+    # optional paid Open-Meteo key (shared hosting IPs are often rate limited on the free endpoint)
+    openmeteo_key: str = field(default_factory=lambda: _env("OPENMETEO_KEY", ""))
     soil_cache_seconds: int = field(default_factory=lambda: int(_env("SOIL_CACHE_SECONDS", "86400")))
     http_timeout: float = field(default_factory=lambda: float(_env("HTTP_TIMEOUT", "8")))
     # development only: serve synthetic weather instead of calling Open-Meteo (shown as MOCK in the UI)

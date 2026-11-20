@@ -7,6 +7,11 @@ Model features derived from the feed (matching how the training data is defined)
 
 Also returned for the dashboard / irrigation alerts: current conditions and a 7-day forecast.
 Results are cached; if the API is unreachable the last cached value is served and flagged stale.
+
+Shared hosting IPs (e.g. Render) are often rate limited by the free Open-Meteo endpoint (HTTP 429). So:
+  1. one polite retry on 429/5xx,
+  2. fall back to NASA POWER (free, no key) for the three model features (no current conditions / forecast),
+  3. after a total failure, do not call the APIs again for CA_WEATHER_RETRY_SECONDS.
 """
 from __future__ import annotations
 
@@ -19,8 +24,11 @@ import httpx
 from ..config import get_settings
 
 URL = "https://api.open-meteo.com/v1/forecast"
+URL_KEYED = "https://customer-api.open-meteo.com/v1/forecast"
+NASA_URL = "https://power.larc.nasa.gov/api/temporal/daily/point"
 
 _cache: dict[tuple[float, float], tuple[float, dict]] = {}
+_failed: dict[tuple[float, float], tuple[float, str]] = {}
 _lock = threading.Lock()
 
 
@@ -107,6 +115,82 @@ def _mock(lat: float, lon: float) -> dict:
     return {**out, "stale": False, "cached": False}
 
 
+def parse_nasa_power(data: dict, today: str) -> dict:
+    """Pure function: NASA POWER daily JSON -> our payload (features only; no current conditions or forecast).
+
+    NASA data lags real time by a few days and marks gaps as -999, so we use the latest valid values:
+    temperature / humidity = mean of the last 7 valid days, rainfall = sum over the valid days scaled to 30 days.
+    """
+    par = data["properties"]["parameter"]
+
+    def series(name):
+        vals = par.get(name, {})
+        return [v for d, v in sorted(vals.items()) if d < today.replace("-", "") and v is not None and v > -900]
+
+    t, h, r = series("T2M"), series("RH2M"), series("PRECTOTCORR")
+    r = r[-30:]
+    rain = None
+    if len(r) >= 20:
+        rain = round(sum(r) * 30.0 / len(r), 1)
+    return {
+        "features": {
+            "temperature": round(_mean(t[-7:]), 2) if t else None,
+            "humidity": round(_mean(h[-7:]), 2) if h else None,
+            "rainfall": rain,
+        },
+        "current": {},
+        "forecast": [],
+        "history_days": len(r),
+    }
+
+
+def _get_open_meteo(lat: float, lon: float, s) -> dict:
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m",
+        "daily": "temperature_2m_mean,temperature_2m_max,temperature_2m_min,"
+        "relative_humidity_2m_mean,precipitation_sum,precipitation_probability_max",
+        "past_days": 30,
+        "forecast_days": 7,
+        "timezone": "auto",
+    }
+    url = URL
+    if s.openmeteo_key:
+        params["apikey"], url = s.openmeteo_key, URL_KEYED
+    r = httpx.get(url, params=params, timeout=s.http_timeout)
+    if r.status_code in (429, 500, 502, 503, 504):  # one polite retry
+        try:
+            wait = min(3.0, float(r.headers.get("Retry-After", 1)))
+        except (TypeError, ValueError, AttributeError):
+            wait = 1.0
+        time.sleep(wait)
+        r = httpx.get(url, params=params, timeout=s.http_timeout)
+    r.raise_for_status()
+    return parse_open_meteo(r.json())
+
+
+def _get_nasa(lat: float, lon: float, s) -> dict:
+    from datetime import timedelta
+
+    today = datetime.now(timezone.utc).date()
+    r = httpx.get(
+        NASA_URL,
+        params={
+            "parameters": "T2M,RH2M,PRECTOTCORR",
+            "community": "AG",
+            "latitude": lat,
+            "longitude": lon,
+            "start": (today - timedelta(days=40)).strftime("%Y%m%d"),
+            "end": today.strftime("%Y%m%d"),
+            "format": "JSON",
+        },
+        timeout=max(s.http_timeout, 20),
+    )
+    r.raise_for_status()
+    return parse_nasa_power(r.json(), today.isoformat())
+
+
 def fetch_weather(lat: float, lon: float, *, force: bool = False) -> dict:
     s = get_settings()
     if s.mock_weather:
@@ -115,36 +199,38 @@ def fetch_weather(lat: float, lon: float, *, force: bool = False) -> dict:
     now = time.time()
     with _lock:
         hit = _cache.get(key)
-    if hit and not force and now - hit[0] < s.weather_cache_seconds:
-        return {**hit[1], "stale": False, "cached": True}
-    try:
-        r = httpx.get(
-            URL,
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m",
-                "daily": "temperature_2m_mean,temperature_2m_max,temperature_2m_min,"
-                "relative_humidity_2m_mean,precipitation_sum,precipitation_probability_max",
-                "past_days": 30,
-                "forecast_days": 7,
-                "timezone": "auto",
-            },
-            timeout=s.http_timeout,
-        )
-        r.raise_for_status()
-        payload = parse_open_meteo(r.json())
-        payload["fetched_at"] = datetime.now(timezone.utc).isoformat()
-        payload["source"] = "open-meteo"
-        with _lock:
-            _cache[key] = (now, payload)
-        return {**payload, "stale": False, "cached": False}
-    except Exception as exc:  # network down, rate limit, bad JSON ...
-        if hit:  # serve the last good answer rather than failing the whole recommendation
-            return {**hit[1], "stale": True, "cached": True, "error": str(exc)}
-        raise WeatherUnavailable(str(exc)) from exc
+        failed = _failed.get(key)
+    if hit and not force:
+        # a fallback answer (NASA) is kept only briefly so we go back to Open-Meteo soon
+        ttl = s.weather_cache_seconds if hit[1].get("source") == "open-meteo" else s.weather_retry_seconds
+        if now - hit[0] < ttl:
+            return {**hit[1], "stale": False, "cached": True}
+    if failed and not force and now - failed[0] < s.weather_retry_seconds:  # recent total failure: do not hammer the APIs
+        if hit:
+            return {**hit[1], "stale": True, "cached": True, "error": failed[1]}
+        raise WeatherUnavailable(failed[1])
+
+    errors = []
+    for name, getter in (("open-meteo", _get_open_meteo), ("nasa-power", _get_nasa)):
+        try:
+            payload = getter(lat, lon, s)
+            payload["fetched_at"] = datetime.now(timezone.utc).isoformat()
+            payload["source"] = name
+            with _lock:
+                _cache[key] = (now, payload)
+                _failed.pop(key, None)
+            return {**payload, "stale": False, "cached": False}
+        except Exception as exc:  # network down, rate limit, bad JSON ...
+            errors.append(f"{name}: {exc}")
+    msg = " | ".join(errors)
+    with _lock:
+        _failed[key] = (now, msg)
+    if hit:  # serve the last good answer rather than failing the whole recommendation
+        return {**hit[1], "stale": True, "cached": True, "error": msg}
+    raise WeatherUnavailable(msg)
 
 
 def clear_cache() -> None:
     with _lock:
         _cache.clear()
+        _failed.clear()

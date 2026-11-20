@@ -167,6 +167,7 @@ def live_view(plot_id: str, top_k: int) -> None:
     # status strip
     s_badge = badge("sensors online", "ok") if sensor["online"] else badge("sensors offline", "bad" if sensor["last_seen"] else "mute")
     w_badge = (badge("weather MOCK", "warn") if wx and wx.get("source") == "mock"
+               else badge("weather: NASA POWER", "ok") if wx and wx.get("source") == "nasa-power" and not wx["stale"]
                else badge("weather live", "ok") if wx and not wx["stale"]
                else badge("weather cached", "warn") if wx else badge("weather unavailable", "bad"))
     src = rec["model"]["data_source"]
@@ -218,7 +219,7 @@ def live_view(plot_id: str, top_k: int) -> None:
         w2.metric("Humidity now", "—" if cur.get("humidity") is None else f"{cur['humidity']:.0f} %")
         w3.metric("Rain, last 30 days", "—" if inp["rainfall"] is None else f"{inp['rainfall']:.0f} mm", help="Used as the model's rainfall input")
         rain3 = sum((d["rain_mm"] or 0) for d in wx["forecast"][:3])
-        w4.metric("Rain forecast, 3 days", f"{rain3:.0f} mm")
+        w4.metric("Rain forecast, 3 days", f"{rain3:.0f} mm" if wx["forecast"] else "—", help=None if wx["forecast"] else "Forecast not available from the backup weather source")
         if wx["forecast"]:
             fig = go.Figure(go.Bar(x=[d["date"] for d in wx["forecast"]], y=[d["rain_mm"] or 0 for d in wx["forecast"]], marker_color=PALETTE["moisture"], name="Rain mm"))
             fig.update_layout(height=190, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="mm / day", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
